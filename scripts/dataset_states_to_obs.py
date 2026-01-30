@@ -1,0 +1,799 @@
+"""
+Script to extract observations from low-dimensional simulation states in a robosuite dataset.
+
+Args:
+    dataset (str): path to input hdf5 dataset
+
+    output_name (str): name of output hdf5 dataset
+
+    n (int): if provided, stop after n trajectories are processed
+
+    shaped (bool): if flag is set, use dense rewards
+
+    camera_names (str or [str]): camera name(s) to use for image observations. 
+        Leave out to not use image observations.
+
+    camera_height (int): height of image observation.
+
+    camera_width (int): width of image observation
+
+    done_mode (int): how to write done signal. If 0, done is 1 whenever s' is a success state.
+        If 1, done is 1 at the end of each trajectory. If 2, both.
+
+    copy_rewards (bool): if provided, copy rewards from source file instead of inferring them
+
+    copy_dones (bool): if provided, copy dones from source file instead of inferring them
+
+Example usage:
+    
+    # extract low-dimensional observations
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name low_dim.hdf5 --done_mode 2
+    
+    # extract 84x84 image observations
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name image.hdf5 \
+        --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+
+    # extract 84x84 image and depth observations
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name depth.hdf5 \
+        --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 --depth
+
+    # (space saving option) extract 84x84 image observations with compression and without 
+    # extracting next obs (not needed for pure imitation learning algos)
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name image.hdf5 \
+        --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 \
+        --compress --exclude-next-obs
+
+    # use dense rewards, and only annotate the end of trajectories with done signal
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name image_dense_done_1.hdf5 \
+        --done_mode 1 --dense --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+"""
+
+
+import os
+import json
+import h5py
+import argparse
+import numpy as np
+from copy import deepcopy
+from tqdm import tqdm
+
+import robomimic.utils.tensor_utils as TensorUtils
+import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.env_utils as EnvUtils
+from robomimic.envs.env_base import EnvBase
+
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+from hand_tool.trajectory_loader import ObservationProcessor
+from diffusion_policy.common.robomimic_util import RobomimicAbsoluteActionConverter
+import pickle
+import collections
+import pathlib
+
+import multiprocessing
+from scipy.spatial.transform import Rotation as R
+multiprocessing.set_start_method('spawn', force=True)
+
+def find_index_after_pattern(text, pattern, after_pattern):
+        # Find the index of the first occurrence of after_pattern
+        start_index = text.find(after_pattern)
+        if start_index == -1:
+            return -1
+        
+        # Search for pattern after the start_index
+        index_after_pattern = text.find(pattern, start_index)
+        if index_after_pattern == -1:
+            return -1
+        
+        # Return the index after the pattern
+        return index_after_pattern + len(pattern)
+
+def exclude_cameras_from_obs(traj, camera_names, store_voxel):
+    if len(camera_names) > 0:
+        for cam in camera_names:
+            del traj['obs'][f"{cam}_image"]
+            del traj['obs'][f"{cam}_depth"]
+            # del traj['obs'][f"{cam}_rgbd"]
+
+
+def visualize_voxel(traj):
+    
+    np_voxels = traj['obs']['voxels'][0]
+    #occupancy = traj['obs']['voxels'][0][0,:,:,:]
+    #indices = np.argwhere(occupancy == 1)[0]
+
+    # Create a 3D plot
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    indices = np.argwhere(np_voxels[0] != 0)
+    colors = np_voxels[1:, indices[:, 0], indices[:, 1], indices[:, 2]].T
+
+    ax.scatter(indices[:, 0], indices[:, 1], indices[:, 2], c=colors/255., marker='s')
+
+    # Set labels and show the plot
+    ax.set_xlabel('X Axis')
+    ax.set_ylabel('Y Axis')
+    ax.set_zlabel('Z Axis')
+    ax.set_xlim(0, 64)
+    ax.set_ylim(0, 64)
+    ax.set_zlim(0, 64)  
+
+    plt.show()
+
+def extract_trajectory(
+    env_meta,
+    args, 
+    camera_names,
+    initial_state, 
+    states, 
+    actions,
+    done_mode,
+    store_voxel=True,
+    store_pcd=True,
+    pretrain_noise=False,
+    camera_height=84, 
+    camera_width=84,
+    render=False,
+):
+    """
+    Helper function to extract observations, rewards, and dones along a trajectory using
+    the simulator environment.
+
+    Args:
+        env (instance of EnvBase): environment
+        initial_state (dict): initial simulation state to load
+        states (np.array): array of simulation states to load to extract information
+        actions (np.array): array of actions
+        done_mode (int): how to write done signal. If 0, done is 1 whenever s' is a 
+            success state. If 1, done is 1 at the end of each trajectory. 
+            If 2, do both.
+    """
+    done_mode = args.done_mode
+    env = EnvUtils.create_env_for_data_processing(
+        env_meta=env_meta,
+        # camera_names=['frontview', 'birdview', 'agentview', 'sideview', 'agentview_full', 'robot0_robotview', 'robot0_eye_in_hand'], 
+        camera_names=camera_names, 
+        camera_height=args.camera_height, 
+        camera_width=args.camera_width, 
+        reward_shaping=args.shaped,
+        use_depth_obs=True,
+        render=render
+    )
+    # sample_rate = 3
+    obs_processor = ObservationProcessor(is_simulation=True)
+         
+    assert states.shape[0] == actions.shape[0]
+
+    # load the initial state
+    env.reset()
+    if render:
+        env.env.viewer.set_camera(camera_id=0)
+
+    initial_xml =  initial_state['model']
+    del initial_state['model']
+    obs = env.reset_to(initial_state)
+    # save modified model xml for this episode
+    initial_state['model'] = env.env.edit_model_xml(initial_xml)
+
+    
+    # maybe add in intrinsics and extrinsics for all cameras
+    camera_info = None
+    is_robosuite_env = EnvUtils.is_robosuite_env(env=env)
+    if is_robosuite_env:
+        camera_info = get_camera_info(
+            env=env,
+            camera_names=camera_names, 
+            camera_height=camera_height, 
+            camera_width=camera_width,
+        )
+
+    traj = dict(
+        obs=[], 
+        next_obs=[], 
+        rewards=[], 
+        dones=[], 
+        actions=np.array(actions), 
+        states=np.array(states), 
+        initial_state_dict=initial_state,
+    )
+    traj_len = states.shape[0]
+    # iteration variable @t is over "next obs" indices
+    for t in range(1, traj_len + 1):
+
+        # get next observation
+        if t == traj_len:
+            # play final action to get next observation for last timestep
+            next_obs, _, _, _ = env.step(actions[t - 1])
+        else:
+            # reset to simulator state to get observation
+            next_obs = env.reset_to({"states" : states[t]})
+        
+        if render:
+            print(actions[t-1])
+            env.env.render()
+        # infer reward signal
+        # note: our tasks use reward r(s'), reward AFTER transition, so this is
+        #       the reward for the current timestep
+        r = env.get_reward()
+
+        # infer done signal
+        done = False
+        if (done_mode == 1) or (done_mode == 2):
+            # done = 1 at end of trajectory
+            done = done or (t == traj_len)
+        if (done_mode == 0) or (done_mode == 2):
+            # done = 1 when s' is task success state
+            done = done or env.is_success()["task"]
+        done = int(done)
+
+        if pretrain_noise:
+            constant_noise = np.array([0.01, 0.01, 0.02])
+            # add random and constant rotation noise for pretraining (using scipy)
+            noise_pos = np.random.normal(0, 0.01, size=(3,)) + constant_noise
+            new_pose = obs['robot0_eef_pos'] + noise_pos
+
+            # rotation noise: small random axis-angle + small constant yaw
+            quat = obs['robot0_eef_quat']
+            rand_axis = np.random.normal(0.0, 1.0, size=(3,))
+            rand_axis /= (np.linalg.norm(rand_axis) + 1e-8)
+            rand_angle = np.random.normal(0.0, np.deg2rad(2.0))  # ~2 deg std
+
+            const_axis = np.array([0.0, 0.0, 1.0])
+            const_angle = np.deg2rad(1.0)  # ~1 deg yaw
+
+            noise_rot = R.from_rotvec(rand_axis * rand_angle) * R.from_rotvec(const_axis * const_angle)
+            new_quat = (noise_rot * R.from_quat(quat)).as_quat()
+
+            obs['robot0_eef_pos'] = new_pose
+            obs['robot0_eef_quat'] = new_quat
+            
+        # render pcd
+        ee_pose = np.concatenate([obs['robot0_eef_pos'], obs['robot0_eef_quat']], axis=0)
+        gripper_state = obs['robot0_gripper_qpos'][0]
+        joint_pos = np.array([gripper_state, gripper_state, *obs['robot0_joint_pos']])
+        pcd, render_pcd = obs_processor.get_policy_obs(obs['pcd'], ee_pose, joint_pos, gripper_state)
+        obs['pcd'] = pcd
+        obs['render_pcd'] = render_pcd
+        rgb_dict, depth_dict, is_contact = obs_processor.get_policy_images({'robot0_eye_in_hand': obs['robot0_eye_in_hand_image']}, {'robot0_eye_in_hand': obs['robot0_eye_in_hand_depth']})
+        # obs['robot0_eye_in_hand_image'] = rgb_dict['robot0_eye_in_hand']
+        # obs['robot0_eye_in_hand_depth'] = depth_dict['robot0_eye_in_hand']
+        obs['is_contact'] = np.array([is_contact])
+
+        # collect transition
+        traj["obs"].append(obs)
+        traj["next_obs"].append(next_obs)
+        traj["rewards"].append(r)
+        traj["dones"].append(done)
+
+        # update for next iter
+        obs = deepcopy(next_obs)
+
+    # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
+    traj["obs"] = TensorUtils.list_of_flat_dict_to_dict_of_list(traj["obs"])
+    del traj["next_obs"]
+    # traj["next_obs"] = TensorUtils.list_of_flat_dict_to_dict_of_list(traj["next_obs"])
+
+    if not store_voxel:
+        try:
+            del traj["obs"]['voxels']
+            del traj["obs"]['local_voxels']
+        except:
+            pass
+
+    if not store_pcd:
+        obs_key = list(traj["obs"].keys())
+        for k in obs_key:
+            if "pcd" in k:
+                try:
+                    del traj["obs"][k]
+                except:
+                    pass
+
+    # list to numpy array
+    for k in traj:
+        if k == "initial_state_dict":
+            continue
+        if isinstance(traj[k], dict):
+            for kp in traj[k]:
+                traj[k][kp] = np.array(traj[k][kp])
+        else:
+            traj[k] = np.array(traj[k])
+
+    return traj, camera_info
+
+
+def get_camera_info(
+    env,
+    camera_names=None, 
+    camera_height=84, 
+    camera_width=84,
+):
+    """
+    Helper function to get camera intrinsics and extrinsics for cameras being used for observations.
+    """
+
+    # TODO: make this function more general than just robosuite environments
+    assert EnvUtils.is_robosuite_env(env=env)
+
+    if camera_names is None:
+        return None
+
+    camera_info = dict()
+    for cam_name in camera_names:
+        K = env.get_camera_intrinsic_matrix(camera_name=cam_name, camera_height=camera_height, camera_width=camera_width)
+        R = env.get_camera_extrinsic_matrix(camera_name=cam_name) # camera pose in world frame
+        if "eye_in_hand" in cam_name:
+            # convert extrinsic matrix to be relative to robot eef control frame
+            assert cam_name.startswith("robot0")
+            eef_site_name = env.base_env.robots[0].controller.eef_name
+            eef_pos = np.array(env.base_env.sim.data.site_xpos[env.base_env.sim.model.site_name2id(eef_site_name)])
+            eef_rot = np.array(env.base_env.sim.data.site_xmat[env.base_env.sim.model.site_name2id(eef_site_name)].reshape([3, 3]))
+            eef_pose = np.zeros((4, 4)) # eef pose in world frame
+            eef_pose[:3, :3] = eef_rot
+            eef_pose[:3, 3] = eef_pos
+            eef_pose[3, 3] = 1.0
+            eef_pose_inv = np.zeros((4, 4))
+            eef_pose_inv[:3, :3] = eef_pose[:3, :3].T
+            eef_pose_inv[:3, 3] = -eef_pose_inv[:3, :3].dot(eef_pose[:3, 3])
+            eef_pose_inv[3, 3] = 1.0
+            R = R.dot(eef_pose_inv) # T_E^W * T_W^C = T_E^C
+        camera_info[cam_name] = dict(
+            intrinsics=K.tolist(),
+            extrinsics=R.tolist(),
+        )
+    return camera_info
+
+def worker(x):
+    env_meta, args, camera_names, initial_state, states, actions, store_voxel, store_pcd, pretrain_noise, render= x
+    traj, camera_info = extract_trajectory(
+        env_meta=env_meta,
+        args=args,
+        camera_names=camera_names,
+        initial_state=initial_state, 
+        states=states, 
+        actions=actions,
+        store_voxel = store_voxel,
+        store_pcd = store_pcd, 
+        pretrain_noise = pretrain_noise,
+        done_mode=args.done_mode,
+        camera_height=args.camera_height, 
+        camera_width=args.camera_width,
+        render=render
+    )
+    return traj, camera_info
+
+
+def dataset_states_to_obs(args):
+    store_voxel = args.store_voxel
+    store_pcd = args.store_pcd
+    multiview = args.multiview
+    pretrain_noise = args.pretrain_noise
+    render = args.render
+    if render:
+        assert args.num_workers==1, "args.num_workers should be 1 if render"
+    if args.depth:
+        assert len(args.camera_names) > 0, "must specify camera names if using depth"
+
+    # create environment to use for data processing
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
+    # camera_names = ['robot0_eye_in_hand', 'spaceview',]
+    camera_names = args.camera_names.split(' ') if ' ' in args.camera_names else [args.camera_names]
+    main_camera = args.main_camera
+    assert main_camera in camera_names, "ERROR: You need to include main_camera in camera_names."
+    # env_meta['env_kwargs']['main_camera'] = main_camera
+    print(camera_names)
+    additional_camera_for_voxel = ['sideview', 'sideview2', 'backview'] if store_voxel or multiview or store_pcd else []
+    camera_names = camera_names + additional_camera_for_voxel
+
+    env = EnvUtils.create_env_for_data_processing(
+        env_meta=env_meta,
+        camera_names=camera_names, 
+        camera_height=args.camera_height, 
+        camera_width=args.camera_width, 
+        reward_shaping=args.shaped,
+        use_depth_obs=args.depth,
+    )
+
+    print("==== Using environment with the following metadata ====")
+    print(json.dumps(env.serialize(), indent=4))
+    print("")
+
+    # some operations for playback are robosuite-specific, so determine if this environment is a robosuite env
+    is_robosuite_env = EnvUtils.is_robosuite_env(env_meta)
+    camera_info = None
+    if is_robosuite_env:
+        camera_info = env.get_camera_info(
+            camera_names=camera_names, 
+            camera_height=args.camera_height, 
+            camera_width=args.camera_width,
+        )
+
+    # list of all demonstration episodes (sorted in increasing number order)
+    f = h5py.File(args.dataset, "r")
+    demos = list(f["data"].keys())
+    inds = np.argsort([int(elem[5:]) for elem in demos])
+    demos = np.array(demos)[inds].tolist()
+
+    assert len(demos) > 0, "No demonstrations found in dataset {}".format(args.dataset)
+    assert len(demos) >= args.n, f"Number of demonstrations in dataset {args.dataset} ({len(demos)}) is less than n ({args.n})"
+
+    # maybe reduce the number of demonstrations to playback
+    if args.n is not None:
+        demos = demos[:args.n]
+
+    # output file in same directory as input file
+    save_path = os.path.dirname(args.output_name)
+    os.makedirs(save_path, exist_ok=True)
+    # output_path = os.path.join(os.path.dirname(args.dataset), args.output_name)
+    f_out = h5py.File(args.output_name, "w")
+    data_grp = f_out.create_group("data")
+    print("input file: {}".format(args.dataset))
+    print("output file: {}".format(args.output_name))
+
+    total_samples = 0
+    num_workers = args.num_workers
+    
+    start_idx = 0
+    for i in range(0, len(demos), num_workers):
+        end = min(i + num_workers, len(demos))
+        initial_state_list = []
+        states_list = []
+        actions_list = []
+        for j in range(i, end):
+            ep = demos[j]
+            # prepare initial state to reload from
+            states = f["data/{}/states".format(ep)][()]
+            initial_state = dict(states=states[0])
+            if is_robosuite_env:
+                initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
+            actions = f["data/{}/actions".format(ep)][()]
+
+            initial_state_list.append(initial_state)
+            states_list.append(states)
+            actions_list.append(actions)
+            
+        with multiprocessing.Pool(num_workers) as pool:
+            output = pool.map(worker, [[env_meta, args, camera_names, initial_state_list[j], states_list[j], actions_list[j], store_voxel, store_pcd, pretrain_noise, render] for j in range(len(initial_state_list))]) 
+        # output = worker([env_meta, args, camera_names, initial_state_list[0], states_list[0], actions_list[0], store_voxel, store_pcd, render])
+
+        for j, ind in enumerate(range(i, end)):
+            # ep = demos[ind]
+            ep = f"demo_{start_idx}"
+            traj, camera_info = output[j]
+            exclude_cameras_from_obs(traj, additional_camera_for_voxel, store_voxel)
+            # maybe copy reward or done signal from source file
+            if args.copy_rewards:
+                traj["rewards"] = f["data/{}/rewards".format(ep)][()]
+            if args.copy_dones:
+                traj["dones"] = f["data/{}/dones".format(ep)][()]
+
+            # store transitions
+
+            # IMPORTANT: keep name of group the same as source file, to make sure that filter keys are
+            #            consistent as well
+            ep_data_grp = data_grp.create_group(ep)
+            ep_data_grp.create_dataset("actions", data=np.array(traj["actions"]))
+            ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
+            ep_data_grp.create_dataset("rewards", data=np.array(traj["rewards"]))
+            ep_data_grp.create_dataset("dones", data=np.array(traj["dones"]))
+            for k in traj["obs"]:
+                if args.compress:
+                    ep_data_grp.create_dataset("obs/{}".format(k), data=np.array(traj["obs"][k]), compression="gzip")
+                else:
+                    ep_data_grp.create_dataset("obs/{}".format(k), data=np.array(traj["obs"][k]))
+                if not args.exclude_next_obs:
+                    if args.compress:
+                        ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]), compression="gzip")
+                    else:
+                        ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]))
+
+            # episode metadata
+            if is_robosuite_env:
+                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
+            
+            if camera_info is not None:
+                assert is_robosuite_env
+                ep_data_grp.attrs["camera_info"] = json.dumps(camera_info, indent=4)
+            ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
+            total_samples += traj["actions"].shape[0]
+            print("ep {}: wrote {} transitions to group {}".format(ind, ep_data_grp.attrs["num_samples"], ep))
+            start_idx += 1
+        
+
+
+    # copy over all filter keys that exist in the original hdf5
+    if "mask" in f:
+        f.copy("mask", f_out)
+
+    # global metadata
+    data_grp.attrs["total"] = total_samples
+    data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
+    print("Wrote {} trajectories to {}".format(len(demos), output_path))
+
+    f.close()
+    f_out.close()
+
+
+def action_conversion_worker(x):
+    """Worker function for robomimic action conversion"""
+    path, idx, do_eval, state_as_action = x
+    converter = RobomimicAbsoluteActionConverter(path, state_as_action=state_as_action)
+    if do_eval:
+        abs_actions, info = converter.convert_and_eval_idx(idx)
+    else:
+        abs_actions = converter.convert_idx(idx)
+        info = dict()
+    return abs_actions, info
+
+
+def convert_actions(output_path, eval_dir=None, num_workers=None, state_as_action=False):
+    """
+    Convert relative actions to absolute actions using robomimic converter.
+    This modifies the dataset file in place.
+
+    Args:
+        output_path (str): path to the hdf5 dataset to convert
+        eval_dir (str): directory to output evaluation metrics (optional)
+        num_workers (int): number of parallel workers
+        state_as_action (bool): store the current abs state for each obs
+    """
+    output_path = pathlib.Path(output_path).expanduser()
+    assert output_path.is_file(), f"Output file {output_path} does not exist"
+
+    do_eval = False
+    if eval_dir is not None:
+        eval_dir = pathlib.Path(eval_dir).expanduser()
+        assert eval_dir.parent.exists(), f"Parent directory of {eval_dir} does not exist"
+        do_eval = True
+
+    print("\n" + "="*50)
+    print("Starting robomimic action conversion...")
+    print("="*50)
+
+    # Get number of demos by opening and closing the file properly
+    with h5py.File(output_path, "r") as f:
+        demos = list(f["data"].keys())
+        num_demos = len(demos)
+
+    # Run conversion in parallel
+    with multiprocessing.Pool(num_workers) as pool:
+        results = pool.map(
+            action_conversion_worker,
+            [(output_path, i, do_eval, state_as_action) for i in range(num_demos)]
+        )
+
+    # Modify actions in the output file
+    print("Writing converted actions to dataset...")
+    with h5py.File(output_path, 'r+') as out_file:
+        for i in tqdm(range(num_demos), desc="Writing converted actions"):
+            abs_actions, info = results[i]
+            demo = out_file[f'data/demo_{i}']
+            demo['actions'][:] = abs_actions
+
+    print(f"✓ Action conversion complete for {num_demos} demonstrations")
+
+    # Save evaluation metrics if requested
+    if do_eval:
+        eval_dir.mkdir(parents=False, exist_ok=True)
+
+        print("Writing error_stats.pkl")
+        infos = [info for _, info in results]
+        pickle.dump(infos, eval_dir.joinpath('error_stats.pkl').open('wb'))
+
+        print("Generating visualization")
+        metrics = ['pos', 'rot']
+        metrics_dicts = dict()
+        for m in metrics:
+            metrics_dicts[m] = collections.defaultdict(list)
+
+        for i in range(len(infos)):
+            info = infos[i]
+            for k, v in info.items():
+                for m in metrics:
+                    metrics_dicts[m][k].append(v[m])
+
+        from matplotlib import pyplot as plt
+        plt.switch_backend('PDF')
+
+        fig, ax = plt.subplots(1, len(metrics))
+        for i in range(len(metrics)):
+            axis = ax[i]
+            data = metrics_dicts[metrics[i]]
+            for key, value in data.items():
+                axis.plot(value, label=key)
+            axis.legend()
+            axis.set_title(metrics[i])
+        fig.set_size_inches(10, 4)
+        fig.savefig(str(eval_dir.joinpath('error_stats.pdf')))
+        fig.savefig(str(eval_dir.joinpath('error_stats.png')))
+
+        print(f"✓ Evaluation metrics saved to {eval_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="path to input hdf5 dataset",
+    )
+    # name of hdf5 to write - it will be in the same directory as @dataset
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        required=True,
+        help="name of output hdf5 dataset",
+    )
+
+    # specify number of demos to process - useful for debugging conversion with a handful
+    # of trajectories
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=None,
+        help="(optional) stop after n trajectories are processed",
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="(optional) num_workers for parallel saving",
+    )
+
+    # flag for reward shaping
+    parser.add_argument(
+        "--shaped", 
+        action='store_true',
+        help="(optional) use shaped rewards",
+    )
+
+    # camera names to use for observations
+    parser.add_argument(
+        "--camera_names",
+        type=str,
+        default='spaceview agentview robot0_eye_in_hand',
+        help="(optional) camera name(s) to use for image observations. Leave out to not use image observations.",
+    )
+
+    # set main camera which is used to get gripper-centric images
+    parser.add_argument(
+        "--main_camera",
+        type=str,
+        default='agentview',
+        help="(optional) main camera for gripper-centric images",
+    )
+
+    parser.add_argument(
+        "--camera_height",
+        type=int,
+        default=84,
+        help="(optional) height of image observations",
+    )
+
+    parser.add_argument(
+        "--camera_width",
+        type=int,
+        default=84,
+        help="(optional) width of image observations",
+    )
+
+    # flag for including depth observations per camera
+    parser.add_argument(
+        "--depth", 
+        action='store_true',
+        help="(optional) use depth observations for each camera",
+    )
+
+    # flag for render visualization
+    parser.add_argument(
+        "--render", 
+        action='store_true',
+        help="(optional) render frames to check demonstrations",
+    )
+
+    parser.add_argument(
+        "--multiview", 
+        action='store_true',
+        help="(optional) render pcd from multiple views",
+    )
+
+    # specifies how the "done" signal is written. If "0", then the "done" signal is 1 wherever 
+    # the transition (s, a, s') has s' in a task completion state. If "1", the "done" signal 
+    # is one at the end of every trajectory. If "2", the "done" signal is 1 at task completion
+    # states for successful trajectories and 1 at the end of all trajectories.
+    parser.add_argument(
+        "--done_mode",
+        type=int,
+        default=2,
+        help="how to write done signal. If 0, done is 1 whenever s' is a success state.\
+            If 1, done is 1 at the end of each trajectory. If 2, both.",
+    )
+
+    # flag for copying rewards from source file instead of re-writing them
+    parser.add_argument(
+        "--copy_rewards", 
+        action='store_true',
+        help="(optional) copy rewards from source file instead of inferring them",
+    )
+
+    # flag for copying dones from source file instead of re-writing them
+    parser.add_argument(
+        "--copy_dones", 
+        action='store_true',
+        help="(optional) copy dones from source file instead of inferring them",
+    )
+
+    # flag to exclude next obs in dataset
+    parser.add_argument(
+        "--exclude-next-obs", 
+        type=bool,
+        default=True,
+        help="(optional) exclude next obs in dataset",
+    )
+
+    # flag to compress observations with gzip option in hdf5
+    parser.add_argument(
+        "--compress", 
+        type=bool,
+        default=True,
+        help="(optional) compress observations with gzip option in hdf5",
+    )
+
+    # flag to save voxels in hdf5
+    parser.add_argument(
+        "--store_voxel", 
+        action='store_true',
+        help="(optional) save voxels in dataset",
+    )
+
+    parser.add_argument(
+        "--store_pcd", 
+        action='store_true',
+        help="(optional) save pcd in dataset",
+    )
+
+    parser.add_argument(
+        "--pretrain_noise",
+        action='store_true',
+        help="(optional) save pcd and render_pcd for pretraining with noise",
+    )
+
+    # Robomimic action conversion options
+    parser.add_argument(
+        "--convert_actions", 
+        type=bool,
+        default=True,
+        help="(optional) convert relative actions to absolute actions after extracting observations",
+    )
+
+    parser.add_argument(
+        "--action_eval_dir",
+        type=str,
+        default=None,
+        help="(optional) directory to output action conversion evaluation metrics",
+    )
+
+    parser.add_argument(
+        "--state_as_action",
+        action='store_true',
+        help="(optional) store the current abs state for each obs during action conversion",
+    )
+
+    args = parser.parse_args()
+
+    # Run observation extraction
+    dataset_states_to_obs(args)
+
+    # Optionally run action conversion
+    if args.convert_actions:
+        output_path = os.path.join(os.path.dirname(args.dataset), args.output_name)
+        convert_actions(
+            output_path=output_path,
+            eval_dir=args.action_eval_dir,
+            num_workers=args.num_workers,
+            state_as_action=args.state_as_action
+        )

@@ -7,17 +7,18 @@ The twin robot can be controlled via end-effector poses and provides
 observation data including RGB images, depth maps, and robot masks.
 """
 
+from robosuite.utils.mjcf_utils import xml_path_completion  # if needed, or just use env.sim directly
 from collections import deque
 import cv2
-import numpy as np 
+import numpy as np
 from scipy.spatial.transform import Rotation
 from dataclasses import dataclass
 from typing import Tuple, Union, Any
 
-from robosuite.controllers import load_controller_config # type: ignore
-from robosuite.utils.camera_utils import get_real_depth_map # type: ignore
-from robomimic.envs.env_robosuite import EnvRobosuite # type: ignore
-import robomimic.utils.obs_utils as ObsUtils # type: ignore
+from robosuite.controllers import load_controller_config  # type: ignore
+from robosuite.utils.camera_utils import get_real_depth_map  # type: ignore
+from robomimic.envs.env_robosuite import EnvRobosuite  # type: ignore
+import robomimic.utils.obs_utils as ObsUtils  # type: ignore
 
 
 @dataclass
@@ -44,10 +45,12 @@ class MujocoCameraParams:
     principalpixel: np.ndarray
     focalpixel: np.ndarray
 
+
 # Color constants for visualization (RGBA format)
 THUMB_COLOR = [0, 1, 0, 1]  # Green for thumb
 INDEX_COLOR = [1, 0, 0, 1]  # Red for index finger
 HAND_EE_COLOR = [0, 0, 1, 1]  # Blue for hand end-effector
+
 
 def convert_real_camera_ori_to_mujoco(camera_ori_matrix: np.ndarray) -> np.ndarray:
     """
@@ -79,13 +82,14 @@ class TwinRobot:
     - Robot and gripper mask generation
     - Observation history management
     """
-    
+
     # Robot configuration constants
     DEFAULT_ROBOT_BASE_POS = np.array([-0.56, 0, 0.912])
-    
+    # DEFAULT_ROBOT_BASE_POS = np.array([0, 0, 0])  
+
     def __init__(self, robot_name: str, gripper_name: str, camera_params: MujocoCameraParams, camera_height: int, camera_width: int,
-                 render: bool, n_steps_short: int, n_steps_long: int, debug_cameras: list[str] = [], 
-                 square: bool = False): 
+                 render: bool, n_steps_short: int, n_steps_long: int, debug_cameras: list[str] = [],
+                 square: bool = False):
         """
         Initialize the single-arm robot twin.
         
@@ -107,11 +111,11 @@ class TwinRobot:
         self.camera_params = camera_params
         self.render = render
         self.n_steps_long = n_steps_long
-        self.n_steps_short= n_steps_short
+        self.n_steps_short = n_steps_short
         self.num_frames = 2  # Number of frames to keep in observation history
         self.camera_height = camera_height
         self.camera_width = camera_width
-        self.camera_name = "frontview"  # Main camera name for single-arm setup
+        self.camera_name = "agentview"  # Main camera name for single-arm setup
         self.square = square
         self.debug_cameras = list(debug_cameras) if debug_cameras else []
 
@@ -124,26 +128,31 @@ class TwinRobot:
         )
         ObsUtils.initialize_obs_utils_with_obs_specs(
             obs_modality_specs=obs_spec)
-                        
+
         # Configure robosuite environment options
-        options: dict[str, Union[str, list[str], dict[str, Any], bool, int, np.ndarray]] = {}
+        options: dict[str, Union[str, list[str],
+                                 dict[str, Any], bool, int, np.ndarray]] = {}
         options["env_name"] = "Phantom"  # Single-arm environment
         options["robots"] = [self.robot_name]  # Single robot
-        options["gripper_types"] = [f"{self.gripper_name}Gripper"]  # Single gripper
-        
+        options["gripper_types"] = [
+            f"{self.gripper_name}Gripper"]  # Single gripper
+
         # Configure OSC pose controller
-        controller_config = load_controller_config(default_controller="OSC_POSE")
+        controller_config = load_controller_config(
+            default_controller="OSC_POSE")
         controller_config["control_delta"] = False  # Use absolute positioning
-        controller_config["uncouple_pos_ori"] = False  # Couple position and orientation
+        # Couple position and orientation
+        controller_config["uncouple_pos_ori"] = False
         options["controller_configs"] = controller_config
-        
+
         # Camera and observation settings
         options["camera_heights"] = self.camera_height
         options["camera_widths"] = self.camera_width
-        options["camera_segmentations"] = "instance"  # Instance segmentation masks
+        # Instance segmentation masks
+        options["camera_segmentations"] = "instance"
         options["direct_gripper_control"] = True
         options["use_depth_obs"] = True
-        
+
         # Set camera parameters
         options["camera_pos"] = self.camera_params.pos
         options["camera_quat_wxyz"] = self.camera_params.ori_wxyz
@@ -164,6 +173,25 @@ class TwinRobot:
         # Initialize environment and set robot base position
         self.reset()
         self.robot_base_pos = self.DEFAULT_ROBOT_BASE_POS  # Fixed base position for single-arm setup
+        
+        sim = self.env.env.sim
+        cam_id = sim.model.camera_name2id(self.camera_params.name)
+
+        # # Position: fully override (x, y, z) with your calibrated values
+        sim.model.cam_pos[cam_id][:] = np.array(
+            self.camera_params.pos, dtype=float)
+
+        # # Orientation: camera_params.ori_wxyz is already WXYZ for MuJoCo
+        # # If orientation looks weird, you can try swapping to XYZW, but start with WXYZ:
+        sim.model.cam_quat[cam_id][:] = np.array(
+            self.camera_params.ori_wxyz, dtype=float)
+
+        fovy = 2 * np.arctan(0.5 * self.camera_height /
+                             self.camera_params.focalpixel[1]) * 180 / np.pi
+        sim.model.cam_fovy[cam_id] = fovy
+
+        # # Propagate changes
+        sim.forward()
 
     def reset(self):
         """Reset environment and clear observation history."""
@@ -195,22 +223,28 @@ class TwinRobot:
         if ee_pos.ndim > 1:
             ee_pos = ee_pos[-1]
             ee_quat_xyzw = ee_quat_xyzw[-1]
-            
+
         # Add base offset if requested
         if use_base_offset:
             ee_pos = ee_pos + self.robot_base_pos
 
         # Apply -135 degree Z rotation for single-arm setup coordinate conversion
         rot = Rotation.from_quat(ee_quat_xyzw)
-        rot_135deg = Rotation.from_euler('z', -135, degrees=True)
-        new_rot = rot * rot_135deg 
-
+        if self.gripper_name == "Robotiq85":
+            rot_135deg = Rotation.from_euler('z', -135, degrees=True)
+            new_rot = rot * rot_135deg
+        elif self.gripper_name == "Panda":
+            rot_90deg = Rotation.from_euler('z', -90, degrees=True)
+            new_rot = rot * rot_90deg 
+        else:
+            new_rot = rot
+        # new_rot = rot
         # Convert rotation to axis-angle representation
         # Note: commented lines show alternative approach using quaternion directly
         # quat_rotated = rot_rotated135.as_quat()
         # axis_angle = Rotation.from_quat(quat_rotated).as_rotvec()
         axis_angle = new_rot.as_rotvec()
-        
+
         # Combine position, rotation, and gripper action into action vector
         action = np.concatenate([ee_pos, axis_angle, [gripper_action]])
 
@@ -230,14 +264,14 @@ class TwinRobot:
             Deque containing repeated initial observations
         """
         obs_history = deque(
-                [self.move_to_target_state(state, init=True)], 
-                maxlen=self.num_frames,
+            [self.move_to_target_state(state, init=True)],
+            maxlen=self.num_frames,
         )
         # Fill remaining slots with copies of the initial observation
         for _ in range(self.num_frames-1):
             obs_history.append(self.move_to_target_state(state))
         return obs_history
-    
+
     def get_obs_history(self, state: dict) -> list:
         """
         Get observation history with specified length.
@@ -257,7 +291,7 @@ class TwinRobot:
             # Add new observation to history
             self.obs_history.append(self.move_to_target_state(state))
         return list(self.obs_history)
-    
+
     def move_to_target_state(self, state: dict, init=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Move robot to target state and collect observation data.
@@ -277,21 +311,25 @@ class TwinRobot:
             - {cam}_img: Additional camera images if debug_cameras specified
         """
         # Convert gripper position to robot action
-        gripper_action = self._convert_handgripper_pos_to_action(state["gripper_pos"])
-        
+        gripper_action = self._convert_handgripper_pos_to_action(
+            state["gripper_pos"])
+
         # Choose movement duration based on whether this is initialization
         n_steps = self.n_steps_long if init else self.n_steps_short
-        
+
         # Execute movement to target pose
-        obs = self.move_to_pose(state["pos"], state["ori_xyzw"], float(gripper_action), n_steps)
+        obs = self.move_to_pose(
+            state["pos"], state["ori_xyzw"], float(gripper_action), n_steps)
 
         # Extract observation data from simulation
         robot_mask = np.squeeze(self.get_robot_mask(obs))
         gripper_mask = np.squeeze(self.get_gripper_mask(obs))
         rgb_img = self.get_image(obs)
         depth_img = self.get_depth_image(obs)
-        robot_pos = obs["robot0_eef_pos"] - self.robot_base_pos
+        # robot_pos = obs["robot0_eef_pos"] - self.robot_base_pos
+        robot_pos = obs["robot0_eef_pos"]
         pos_error = np.linalg.norm(robot_pos - state["pos"])
+        print(robot_pos - state["pos"])
 
         # Compile output dictionary
         output = {
@@ -321,7 +359,7 @@ class TwinRobot:
             gripper_pos: Gripper opening distance in meters
             
         Returns:
-            Robot gripper action value (0-255 for Robotiq85)
+            Robot gripper action value scaled to [-1, 1] for robosuite grippers
             
         Raises:
             ValueError: If gripper type is not supported
@@ -333,6 +371,18 @@ class TwinRobot:
             open_gripper_action, closed_gripper_action = 0, 255  # 0=open, 255=closed
             # Linear interpolation between open and closed states
             return np.interp(gripper_pos, [min_gripper_pos, max_gripper_pos], [closed_gripper_action, open_gripper_action])
+        elif self.gripper_name == "Panda":
+            # Map physical opening (m) to robosuite gripper command in [-1, 1]
+            min_gripper_pos, max_gripper_pos = 0.0, 0.080  # 0 to ~8cm opening
+            gripper_pos = np.clip(gripper_pos, min_gripper_pos, max_gripper_pos)
+            open_gripper_action, closed_gripper_action = 1, -1 # robosuite uses sign(action)
+            return float(
+                np.interp(
+                    gripper_pos,
+                    [min_gripper_pos, max_gripper_pos],
+                    [closed_gripper_action, open_gripper_action],
+                )
+            )
         else:
             raise ValueError(f"Gripper name {self.gripper_name} not supported")
 
@@ -352,11 +402,13 @@ class TwinRobot:
             Final observation dictionary from simulation
         """
         # Convert pose to action vector
-        action = self.get_action_from_ee_pose(ee_pos, ee_ori, gripper_action, use_base_offset=True)
-        
+        action = self.get_action_from_ee_pose(
+            ee_pos, ee_ori, gripper_action, use_base_offset=False)
+
         # Execute action for specified number of steps
         for _ in range(n_steps):
             obs, _, _, _ = self.env.step(action)
+            # print("ee_pos:", ee_pos, "on obs[robot0_eef_pos]:", obs["robot0_eef_pos"])
             if self.render:
                 self.env.render()
         return obs
@@ -377,13 +429,13 @@ class TwinRobot:
         img = img.transpose(1, 2, 0)  # Convert from CHW to HWC format
         height = img.shape[0]
         width = img.shape[1]
-        
+
         # Crop to square if requested
         if self.square:
             n_remove = int((width - height)/2)
-            img = img[:,n_remove:-n_remove,:]
+            img = img[:, n_remove:-n_remove, :]
         return img
-    
+
     def get_cam_image(self, obs: dict, camera_name: str) -> np.ndarray:
         """
         Extract RGB image from specific camera.
@@ -399,13 +451,13 @@ class TwinRobot:
         img = img.transpose(1, 2, 0)  # Convert from CHW to HWC format
         height = img.shape[0]
         width = img.shape[1]
-        
+
         # Crop to square if requested
         if self.square:
             n_remove = int((width - height)/2)
-            img = img[:,n_remove:-n_remove,:]
+            img = img[:, n_remove:-n_remove, :]
         return img
-    
+
     def get_seg_image(self, obs: dict) -> np.ndarray:
         """
         Extract instance segmentation image.
@@ -417,14 +469,14 @@ class TwinRobot:
             Segmentation image as uint8 array where each pixel value
             represents a different object instance ID
         """
-        img = obs["frontview_segmentation_instance"]  # Fixed camera name for single-arm
+        img = obs["agentview_segmentation_instance"]  # Fixed camera name for single-arm
         height = img.shape[0]
         width = img.shape[1]
-        
+
         # Crop to square if requested
         if self.square:
             n_remove = int((width - height)/2)
-            img = img[:,n_remove:-n_remove,:]  
+            img = img[:, n_remove:-n_remove, :]
         img = img.astype(np.uint8)
         return img
 
@@ -442,17 +494,17 @@ class TwinRobot:
             Depth image as numpy array where values represent
             distance in meters
         """
-        img = obs["frontview_depth"]  # Fixed camera name for single-arm
+        img = obs["agentview_depth"]  # Fixed camera name for single-arm
         img = get_real_depth_map(sim=self.env.env.sim, depth_map=img)
         height = img.shape[0]
         width = img.shape[1]
-        
+
         # Crop to square if requested
         if self.square:
             n_remove = int((width - height)/2)
-            img = img[:,n_remove:-n_remove,:]
+            img = img[:, n_remove:-n_remove, :]
         return img
-    
+
     def get_robot_mask(self, obs: dict) -> np.ndarray:
         """
         Generate binary mask for robot pixels.
@@ -470,7 +522,7 @@ class TwinRobot:
         mask = np.zeros_like(seg_img)
         mask[seg_img == 1] = 1  # Robot arm
         return mask
-    
+
     def get_gripper_mask(self, obs: dict) -> np.ndarray:
         """
         Generate binary mask for gripper pixels.

@@ -157,26 +157,41 @@ def process_all_demos_parallel(cfg: DictConfig, processor_classes: dict) -> None
             delayed(processor.process_one_demo)(data_sub_folder) for data_sub_folder in all_data_folders
         )
 
-def get_processor_classes(cfg: DictConfig) -> dict:
-    """Initialize the processor classes"""
-    from phantom.processors.bbox_processor import BBoxProcessor
-    from phantom.processors.segmentation_processor import HandSegmentationProcessor, ArmSegmentationProcessor
-    from phantom.processors.hand_processor import Hand2DProcessor, Hand3DProcessor
-    from phantom.processors.action_processor import ActionProcessor
-    from phantom.processors.smoothing_processor import SmoothingProcessor
-    from phantom.processors.robotinpaint_processor import RobotInpaintProcessor
-    from phantom.processors.handinpaint_processor import HandInpaintProcessor
+# def get_processor_classes(cfg: DictConfig) -> dict:
+#     """Initialize the processor classes"""
+#     from phantom.processors.bbox_processor import BBoxProcessor
+#     from phantom.processors.segmentation_processor import HandSegmentationProcessor, ArmSegmentationProcessor
+#     from phantom.processors.hand_processor import Hand2DProcessor, Hand3DProcessor
+#     from phantom.processors.action_processor import ActionProcessor
+#     from phantom.processors.smoothing_processor import SmoothingProcessor
+#     from phantom.processors.robotinpaint_processor import RobotInpaintProcessor
+#     from phantom.processors.handinpaint_processor import HandInpaintProcessor
     
+#     return {
+#         "bbox": BBoxProcessor,
+#         "hand2d": Hand2DProcessor,
+#         "hand3d": Hand3DProcessor,
+#         "hand_segmentation": HandSegmentationProcessor,
+#         "arm_segmentation": ArmSegmentationProcessor,
+#         "action": ActionProcessor,
+#         "smoothing": SmoothingProcessor,
+#         "robot_inpaint": RobotInpaintProcessor,
+#         "hand_inpaint": HandInpaintProcessor,
+#     }
+
+
+def get_processor_classes(cfg: DictConfig) -> dict:
+    """
+    Initialize the processor classes.
+
+    For your use case (only running mode=robot_inpaint on preprocessed data),
+    we only need the RobotInpaintProcessor. We *avoid* importing all the
+    detectors / hamer / OpenGL-dependent code that causes EGL errors on macOS.
+    """
+    from phantom.processors.robotinpaint_processor import RobotInpaintProcessor
+
     return {
-        "bbox": BBoxProcessor,
-        "hand2d": Hand2DProcessor,
-        "hand3d": Hand3DProcessor,
-        "hand_segmentation": HandSegmentationProcessor,
-        "arm_segmentation": ArmSegmentationProcessor,
-        "action": ActionProcessor,
-        "smoothing": SmoothingProcessor,
         "robot_inpaint": RobotInpaintProcessor,
-        "hand_inpaint": HandInpaintProcessor,
     }
 
 def validate_mode(cfg: DictConfig) -> None:

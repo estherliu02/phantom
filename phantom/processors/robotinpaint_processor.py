@@ -15,7 +15,7 @@ Processing Pipeline:
 5. Save robot-inpainted videos and training data
 """
 
-import os 
+import os
 import pdb
 import numpy as np
 import cv2
@@ -28,12 +28,13 @@ from dataclasses import dataclass
 
 from phantom.processors.phantom_data import TrainingData, TrainingDataSequence, HandSequence
 from phantom.processors.base_processor import BaseProcessor
-from phantom.twin_bimanual_robot import TwinBimanualRobot, MujocoCameraParams
-from phantom.twin_robot import TwinRobot
+from phantom.twin_bimanual_robot import TwinBimanualRobot
+from phantom.twin_robot import TwinRobot, MujocoCameraParams
 from phantom.processors.paths import Paths
 
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class RobotState:
@@ -49,7 +50,8 @@ class RobotState:
     ori_xyzw: np.ndarray
     gripper_pos: float
 
-class RobotInpaintProcessor(BaseProcessor):  
+
+class RobotInpaintProcessor(BaseProcessor):
     """
     Uses mujoco to overlay robot on human inpainted images.
     """
@@ -75,33 +77,33 @@ class RobotInpaintProcessor(BaseProcessor):
         Initialize the twin robot simulation with calibrated camera parameters.
         """
         # Generate MuJoCo camera parameters from real-world calibration
-        camera_params = self._get_mujoco_camera_params()  
+        camera_params = self._get_mujoco_camera_params()
         img_w, img_h = self._get_image_dimensions()
-        
+        print("imq_w, img_h:", img_w, img_h)
         # Initialize appropriate robot configuration
         if self.bimanual_setup == "single_arm":
             self.twin_robot = TwinRobot(
-                self.robot, 
+                self.robot,
                 self.gripper,
                 camera_params,
-                camera_height=img_h, 
+                camera_height=img_h,
                 camera_width=img_w,
-                render=self.render, 
-                n_steps_short=3,    
-                n_steps_long=75,    
+                render=self.render,
+                n_steps_short=3,
+                n_steps_long=75,
                 debug_cameras=self.debug_cameras,
                 square=self.square,
             )
         else:
             self.twin_robot = TwinBimanualRobot(
-                self.robot, 
-                self.gripper, 
+                self.robot,
+                self.gripper,
                 self.bimanual_setup,
                 camera_params,
-                camera_height=img_h, 
+                camera_height=img_h,
                 camera_width=img_w,
-                render=self.render, 
-                n_steps_short=10, 
+                render=self.render,
+                n_steps_short=10,
                 n_steps_long=75,
                 debug_cameras=self.debug_cameras,
                 epic=self.epic,
@@ -125,15 +127,16 @@ class RobotInpaintProcessor(BaseProcessor):
         if self._should_skip_processing(save_folder):
             return
         paths = self.get_paths(save_folder)
-        
+
         # Reinitialize robot simulation for each demo to ensure clean state
         self.__del__()
         self._initialize_robot()
-        
+
         # Load and prepare demonstration data
         data = self._load_data(paths)
         images = self._load_images(paths, data["union_indices"])
-        gripper_actions, gripper_widths = self._process_gripper_widths(paths, data)
+        gripper_actions, gripper_widths = self._process_gripper_widths(
+            paths, data)
 
         # Process all frames to generate robot overlays and training data
         sequence, img_overlay, img_birdview = self._process_frames(images, data, gripper_actions, gripper_widths)
@@ -142,7 +145,7 @@ class RobotInpaintProcessor(BaseProcessor):
         self._save_results(paths, sequence, img_overlay, img_birdview)
 
     def _process_frames(self, images: Dict[str, np.ndarray], data: Dict[str, np.ndarray],
-                       gripper_actions: Dict[str, np.ndarray], gripper_widths: Dict[str, np.ndarray]) -> Tuple[TrainingDataSequence, List[np.ndarray], Optional[List[np.ndarray]]]:
+                        gripper_actions: Dict[str, np.ndarray], gripper_widths: Dict[str, np.ndarray]) -> Tuple[TrainingDataSequence, List[np.ndarray], Optional[List[np.ndarray]]]:
         """
         Process each frame to generate robot overlays and training data.
         
@@ -167,13 +170,13 @@ class RobotInpaintProcessor(BaseProcessor):
         for idx in tqdm(range(len(images['human_imgs'])), desc="Processing frames"):
             # Extract robot states for current frame
             left_state = self._get_robot_state(
-                data['ee_pts_left'][idx], 
-                data['ee_oris_left'][idx], 
+                data['ee_pts_left'][idx],
+                data['ee_oris_left'][idx],
                 gripper_widths['left'][idx]
             )
             right_state = self._get_robot_state(
-                data['ee_pts_right'][idx], 
-                data['ee_oris_right'][idx], 
+                data['ee_pts_right'][idx],
+                data['ee_oris_right'][idx],
                 gripper_widths['right'][idx]
             )
 
@@ -181,16 +184,18 @@ class RobotInpaintProcessor(BaseProcessor):
             frame_results = self._process_single_frame(
                 images, left_state, right_state, idx
             )
-            
+
             # Handle failed processing (tracking errors, simulation issues)
             if frame_results is None:
-                print(f"sdfsdfsTracking error too large at frame {idx}, skipping")
+                print(
+                    f"sdfsdfsTracking error too large at frame {idx}, skipping")
                 sequence.add_frame(TrainingData.create_empty_frame(
                     frame_idx=idx,
                 ))
                 img_overlay.append(np.zeros_like(images['human_imgs'][idx]))
                 if "birdview" in self.debug_cameras:
-                    img_birdview.append(np.zeros_like(images['human_imgs'][idx]))
+                    img_birdview.append(np.zeros_like(
+                        images['human_imgs'][idx]))
             else:
                 # Create comprehensive training data annotation
                 sequence.add_frame(TrainingData(
@@ -210,11 +215,10 @@ class RobotInpaintProcessor(BaseProcessor):
                     img_birdview.append(frame_results['birdview_img'])
         return sequence, img_overlay, img_birdview
 
-    
     def _process_single_frame(self, images: Dict[str, np.ndarray],
-                            left_state: RobotState,
-                            right_state: RobotState,
-                            idx: int) -> Optional[Dict[str, np.ndarray]]:
+                              left_state: RobotState,
+                              right_state: RobotState,
+                              idx: int) -> Optional[Dict[str, np.ndarray]]:
         """
         Process a single frame to generate robot overlay and validate tracking.
         
@@ -258,12 +262,15 @@ class RobotInpaintProcessor(BaseProcessor):
         # Validate tracking accuracy to ensure quality
         if self.bimanual_setup == "single_arm":
             if robot_results['pos_err'] > self.TRACKING_ERROR_THRESHOLD:
-                print(f"Tracking error too large at frame {idx}, skipping", robot_results['pos_err'])
-                logger.warning(f"Tracking error too large at frame {idx}, skipping")
+                print(
+                    f"Tracking error too large at frame {idx}, skipping", robot_results['pos_err'])
+                logger.warning(
+                    f"Tracking error too large at frame {idx}, skipping")
                 return None
-        else:        
+        else:
             if robot_results['left_pos_err'] > self.TRACKING_ERROR_THRESHOLD or robot_results['right_pos_err'] > self.TRACKING_ERROR_THRESHOLD:
-                logger.warning(f"Tracking error too large at frame {idx}, skipping")
+                logger.warning(
+                    f"Tracking error too large at frame {idx}, skipping")
                 return None
 
         # Generate robot overlay using appropriate method
@@ -286,7 +293,8 @@ class RobotInpaintProcessor(BaseProcessor):
 
         # Add debug camera views if requested
         for cam in self.debug_cameras:
-            output[f"{cam}_img"] = (robot_results[f"{cam}_img"] * 255).astype(np.uint8)
+            output[f"{cam}_img"] = (
+                robot_results[f"{cam}_img"] * 255).astype(np.uint8)
 
         return output
 
@@ -303,7 +311,8 @@ class RobotInpaintProcessor(BaseProcessor):
         if self.skip_existing:
             try:
                 with os.scandir(save_folder) as it:
-                    existing_files = {entry.name for entry in it if entry.is_file()}
+                    existing_files = {
+                        entry.name for entry in it if entry.is_file()}
                 if str("video_overlay"+f"_{self.robot}_{self.bimanual_setup}.mkv") in existing_files:
                     print(f"Skipping existing demo {save_folder}")
                     return True
@@ -323,19 +332,22 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         if self.bimanual_setup == "single_arm":
             # Get paths based on target hand for single-arm operation
-            smoothed_base = getattr(paths, f"smoothed_actions_{self.target_hand}")
+            smoothed_base = getattr(
+                paths, f"smoothed_actions_{self.target_hand}")
             actions_base = getattr(paths, f"actions_{self.target_hand}")
-            smoothed_actions_path = str(smoothed_base).replace(".npz", f"_{self.bimanual_setup}.npz")
-            actions_path = str(actions_base).replace(".npz", f"_{self.bimanual_setup}.npz")
-            
+            smoothed_actions_path = str(smoothed_base).replace(
+                ".npz", f"_{self.bimanual_setup}.npz")
+            actions_path = str(actions_base).replace(
+                ".npz", f"_{self.bimanual_setup}.npz")
+
             # Load actual trajectory data for target hand
             ee_pts = np.load(smoothed_actions_path)["ee_pts"]
             ee_oris = np.load(smoothed_actions_path)["ee_oris"]
-            
-            # Create dummy data for non-target hand 
+
+            # Create dummy data for non-target hand
             dummy_pts = np.zeros((len(ee_pts), 3))
             dummy_oris = np.eye(3)[None, :, :].repeat(len(ee_oris), axis=0)
-            
+
             # Create data dictionary with target hand data and dummy data for other hand
             other_hand = "right" if self.target_hand == "left" else "left"
             return {
@@ -347,9 +359,12 @@ class RobotInpaintProcessor(BaseProcessor):
             }
 
         # Load bimanual trajectory data
-        smoothed_actions_left_path = str(paths.smoothed_actions_left).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
-        smoothed_actions_right_path = str(paths.smoothed_actions_right).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
-        actions_left_path = str(paths.actions_left).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
+        smoothed_actions_left_path = str(paths.smoothed_actions_left).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
+        smoothed_actions_right_path = str(paths.smoothed_actions_right).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
+        actions_left_path = str(paths.actions_left).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
         return {
             'ee_pts_left': np.load(smoothed_actions_left_path)["ee_pts"],
             'ee_oris_left': np.load(smoothed_actions_left_path)["ee_oris"],
@@ -374,7 +389,7 @@ class RobotInpaintProcessor(BaseProcessor):
             'human_imgs': np.array(media.read_video(paths.video_human_inpaint))[union_indices],
             'imgs_depth': np.load(paths.depth)[union_indices] if self.use_depth else None
         }
-    
+
     def _process_gripper_widths(self, paths: Paths, data: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
         Process gripper distance data into robot action commands.
@@ -391,25 +406,28 @@ class RobotInpaintProcessor(BaseProcessor):
         if self.bimanual_setup == "single_arm":
             # Get the appropriate smoothed actions path based on target hand
             base_path = getattr(paths, f"smoothed_actions_{self.target_hand}")
-            smoothed_actions_path = str(base_path).replace(".npz", f"_{self.bimanual_setup}.npz")
-            
+            smoothed_actions_path = str(base_path).replace(
+                ".npz", f"_{self.bimanual_setup}.npz")
+
             # Compute gripper actions and widths from smoothed data
             actions, widths = self._compute_gripper_actions(
                 np.load(smoothed_actions_path)["ee_widths"]
             )
-            
+
             # Create return dictionaries with actions for target hand, zeros for the other
             num_indices = len(data['union_indices'])
             other_hand = "right" if self.target_hand == "left" else "left"
-            
+
             return (
                 {self.target_hand: actions, other_hand: np.zeros(num_indices)},
                 {self.target_hand: widths, other_hand: np.zeros(num_indices)}
             )
-        
+
         # Process bimanual gripper data
-        smoothed_actions_left_path = str(paths.smoothed_actions_left).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
-        smoothed_actions_right_path = str(paths.smoothed_actions_right).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
+        smoothed_actions_left_path = str(paths.smoothed_actions_left).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
+        smoothed_actions_right_path = str(paths.smoothed_actions_right).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
         left_actions, left_widths = self._compute_gripper_actions(
             np.load(smoothed_actions_left_path)["ee_widths"]
         )
@@ -417,7 +435,6 @@ class RobotInpaintProcessor(BaseProcessor):
             np.load(smoothed_actions_right_path)["ee_widths"]
         )
         return {'left': left_actions, 'right': right_actions}, {'left': left_widths, 'right': right_widths}
-
 
     def _compute_gripper_actions(self, list_gripper_dist: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -432,12 +449,14 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         try:
             # Analyze gripper distance range and determine grasp threshold
-            min_val, max_val = np.min(list_gripper_dist), np.max(list_gripper_dist)
+            min_val, max_val = np.min(
+                list_gripper_dist), np.max(list_gripper_dist)
             thresh = min_val + 0.2 * (max_val - min_val)  # 20% above minimum
-            
+
             # Classify gripper states: 0 = closed/grasping, 1 = open
-            gripper_state = np.array([0 if dist < thresh else 1 for dist in list_gripper_dist])
-            
+            gripper_state = np.array(
+                [0 if dist < thresh else 1 for dist in list_gripper_dist])
+
             # Find range of grasping action
             min_idx_pos = np.where(gripper_state == 0)[0][0]
             max_idx_pos = np.where(gripper_state == 0)[0][-1]
@@ -445,19 +464,20 @@ class RobotInpaintProcessor(BaseProcessor):
             # Generate gripper action commands
             list_gripper_actions = []
             for idx in range(len(list_gripper_dist)):
-                if min_idx_pos <= idx <= max_idx_pos:   
+                if min_idx_pos <= idx <= max_idx_pos:
                     # During grasping phase: use grasp command (0) and limit distance
                     list_gripper_actions.append(0)
-                    list_gripper_dist[idx] = np.min([list_gripper_dist[idx], thresh])
+                    list_gripper_dist[idx] = np.min(
+                        [list_gripper_dist[idx], thresh])
                 else:
                     # Outside grasping phase: use distance as action command
                     list_gripper_actions.append(list_gripper_dist[idx])
         except:
             # Fallback: use distances directly if processing fails
-            list_gripper_actions = list_gripper_dist.tolist()  
-        
+            list_gripper_actions = list_gripper_dist.tolist()
+
         return np.array(list_gripper_actions), list_gripper_dist
-    
+
     def _get_robot_state(self, ee_pt: np.ndarray, ori_matrix: np.ndarray, gripper_dist: float) -> RobotState:
         """
         Convert trajectory data to robot state representation.
@@ -472,9 +492,10 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         # Convert rotation matrix to quaternion (XYZW format for robot control)
         ori_xyzw = Rotation.from_matrix(ori_matrix).as_quat(scalar_first=False)
-        robot_state = RobotState(pos=ee_pt, ori_xyzw=ori_xyzw, gripper_pos=gripper_dist)
+        robot_state = RobotState(
+            pos=ee_pt, ori_xyzw=ori_xyzw, gripper_pos=gripper_dist)
         return robot_state
-    
+
     def _process_robot_overlay(self, img: np.ndarray, robot_results: Dict[str, Any]) -> np.ndarray:
         """
         Create robot overlay on human image using segmentation masks.
@@ -489,30 +510,36 @@ class RobotInpaintProcessor(BaseProcessor):
         # Extract robot rendering and segmentation data
         rgb_img_sim = (robot_results['rgb_img'] * 255).astype(np.uint8)
         H, W = rgb_img_sim.shape[:2]
-        
+
         # Resize robot rendering and masks to match output resolution
         if self.square:
-            rgb_img_sim = cv2.resize(rgb_img_sim, (self.output_resolution, self.output_resolution))
-            robot_mask = cv2.resize(robot_results['robot_mask'], (self.output_resolution, self.output_resolution))
+            rgb_img_sim = cv2.resize(
+                rgb_img_sim, (self.output_resolution, self.output_resolution))
+            robot_mask = cv2.resize(
+                robot_results['robot_mask'], (self.output_resolution, self.output_resolution))
             robot_mask[robot_mask > 0] = 1
-            gripper_mask = cv2.resize(robot_results['gripper_mask'], (self.output_resolution, self.output_resolution))
+            gripper_mask = cv2.resize(
+                robot_results['gripper_mask'], (self.output_resolution, self.output_resolution))
             gripper_mask[gripper_mask > 0] = 1
         else:
-            rgb_img_sim = cv2.resize(rgb_img_sim, (int(W/H*self.output_resolution), self.output_resolution))
-            robot_mask = cv2.resize(robot_results['robot_mask'], (int(W/H*self.output_resolution), self.output_resolution))
+            rgb_img_sim = cv2.resize(
+                rgb_img_sim, (int(W/H*self.output_resolution), self.output_resolution))
+            robot_mask = cv2.resize(robot_results['robot_mask'], (int(
+                W/H*self.output_resolution), self.output_resolution))
             robot_mask[robot_mask > 0] = 1
-            gripper_mask = cv2.resize(robot_results['gripper_mask'], (int(W/H*self.output_resolution), self.output_resolution))
+            gripper_mask = cv2.resize(robot_results['gripper_mask'], (int(
+                W/H*self.output_resolution), self.output_resolution))
             gripper_mask[gripper_mask > 0] = 1
-        
+
         # Create overlay by compositing robot over human image
         img_robot_overlay = img.copy()
         overlay_mask = (robot_mask == 1) | (gripper_mask == 1)
         img_robot_overlay[overlay_mask] = rgb_img_sim[overlay_mask]
-        
+
         return img_robot_overlay
 
-    def _process_robot_overlay_with_depth(self, img: np.ndarray, hand_mask: np.ndarray, 
-                                    img_depth: np.ndarray, robot_results: Dict[str, Any]) -> np.ndarray:
+    def _process_robot_overlay_with_depth(self, img: np.ndarray, hand_mask: np.ndarray,
+                                          img_depth: np.ndarray, robot_results: Dict[str, Any]) -> np.ndarray:
         """
         Create depth-aware robot overlay with realistic occlusion handling.
         
@@ -533,12 +560,14 @@ class RobotInpaintProcessor(BaseProcessor):
         H, W = rgb_img_sim.shape[:2]
 
         # Create masked depth images for occlusion analysis
-        depth_sim_masked = self._create_masked_depth(depth_img_sim, robot_mask, gripper_mask)
-        depth_masked = self._create_masked_depth(img_depth, robot_mask, gripper_mask)
-        
+        depth_sim_masked = self._create_masked_depth(
+            depth_img_sim, robot_mask, gripper_mask)
+        depth_masked = self._create_masked_depth(
+            img_depth, robot_mask, gripper_mask)
+
         # Process hand mask for improved occlusion handling
         hand_mask = self._dilate_mask(hand_mask.astype(np.uint8))
-        
+
         # Create overlay mask using depth-based occlusion
         img_robot_overlay = img.copy()
         overlay_mask = self._create_overlay_mask(
@@ -547,24 +576,25 @@ class RobotInpaintProcessor(BaseProcessor):
 
         # Convert and resize robot rendering
         rgb_img_sim = (rgb_img_sim * 255).astype(np.uint8)
-        
+
         if self.square:
             resize_shape = (self.output_resolution, self.output_resolution)
         else:
-            resize_shape = (int(W/H*self.output_resolution), self.output_resolution)
+            resize_shape = (int(W/H*self.output_resolution),
+                            self.output_resolution)
 
         # Apply final overlay with depth-aware occlusion
         rgb_img_sim = cv2.resize(rgb_img_sim, resize_shape)
         overlay_mask = cv2.resize(overlay_mask.astype(np.uint8), resize_shape)
         overlay_mask[overlay_mask > 0] = 1
         overlay_mask = overlay_mask.astype(bool)
-        
+
         img_robot_overlay[overlay_mask] = rgb_img_sim[overlay_mask]
-        
+
         return img_robot_overlay
-    
-    def _create_masked_depth(self, depth_img: np.ndarray, robot_mask: np.ndarray, 
-                            gripper_mask: np.ndarray) -> np.ndarray:
+
+    def _create_masked_depth(self, depth_img: np.ndarray, robot_mask: np.ndarray,
+                             gripper_mask: np.ndarray) -> np.ndarray:
         """
         Create depth image masked to robot regions for occlusion analysis.
         
@@ -595,8 +625,8 @@ class RobotInpaintProcessor(BaseProcessor):
         return cv2.dilate(mask, kernel, iterations=1)
 
     def _create_overlay_mask(self, robot_mask: np.ndarray, gripper_mask: np.ndarray,
-                            depth_masked: np.ndarray, depth_sim_masked: np.ndarray,
-                            hand_mask: np.ndarray) -> np.ndarray:
+                             depth_masked: np.ndarray, depth_sim_masked: np.ndarray,
+                             hand_mask: np.ndarray) -> np.ndarray:
         """
         Create sophisticated overlay mask using depth-based occlusion reasoning.
         
@@ -612,15 +642,15 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         # Start with basic robot visibility mask
         overlay_mask = (robot_mask == 1) | (gripper_mask == 1)
-        
+
         # Apply depth-based occlusion: hide robot when it's behind real objects
         # and not in hand regions (where occlusion handling is more complex)
         overlay_mask[(depth_masked < depth_sim_masked) & (hand_mask == 0)] = 0
-        
+
         return overlay_mask
 
-    def _save_results(self, paths: Paths, sequence: TrainingDataSequence, img_overlay: List[np.ndarray], 
-                     img_birdview: Optional[List[np.ndarray]] = None) -> None:
+    def _save_results(self, paths: Paths, sequence: TrainingDataSequence, img_overlay: List[np.ndarray],
+                      img_birdview: Optional[List[np.ndarray]] = None) -> None:
         """
         Save comprehensive robot inpainting results to disk.
         
@@ -636,18 +666,21 @@ class RobotInpaintProcessor(BaseProcessor):
         if len(img_overlay) == 0:
             print("No robot inpainted images, skipping")
             return
-        
+
         # Save main robot-inpainted video
-        video_path = str(paths.video_overlay).split(".mkv")[0] + f"_{self.robot}_{self.bimanual_setup}.mkv"
+        video_path = str(paths.video_overlay).split(".mkv")[
+            0] + f"_{self.robot}_{self.bimanual_setup}.mkv"
         self._save_video(video_path, img_overlay)
 
         # Save bird's eye view video for analysis and debugging
         if img_birdview is not None:
-            birdview_path = str(paths.video_birdview).split(".mkv")[0] + f"_{self.robot}_{self.bimanual_setup}.mkv"
+            birdview_path = str(paths.video_birdview).split(
+                ".mkv")[0] + f"_{self.robot}_{self.bimanual_setup}.mkv"
             self._save_video(birdview_path, np.array(img_birdview))
 
         # Save comprehensive training data with robot state annotations
-        training_data_path = str(paths.training_data).split(".npz")[0] + f"_{self.bimanual_setup}.npz"
+        training_data_path = str(paths.training_data).split(".npz")[
+            0] + f"_{self.bimanual_setup}.npz"
         sequence.save(training_data_path)
 
     def _save_video(self, path: str, frames: List[np.ndarray]) -> None:
@@ -659,9 +692,9 @@ class RobotInpaintProcessor(BaseProcessor):
             frames: List of video frames to save
         """
         media.write_video(
-            path, 
-            frames, 
-            fps=self.DEFAULT_FPS, 
+            path,
+            frames,
+            fps=self.DEFAULT_FPS,
             codec=self.DEFAULT_CODEC
         )
 
@@ -682,14 +715,15 @@ class RobotInpaintProcessor(BaseProcessor):
         img_w, img_h = self._get_image_dimensions()
         offset = self._calculate_image_offset(img_w, img_h)
         fx, fy, cx, cy = self._get_camera_intrinsics(offset)
-        sensor_width, sensor_height = self._calculate_sensor_size(img_w, img_h, fx, fy)
+        sensor_width, sensor_height = self._calculate_sensor_size(
+            img_w, img_h, fx, fy)
 
         # Select appropriate camera name based on dataset
         if self.epic:
             camera_name = "zed"
         else:
-            camera_name = "frontview"
-            
+            camera_name = "agentview"
+
         return MujocoCameraParams(
             name=camera_name,
             pos=extrinsics["camera_base_pos"],
@@ -700,7 +734,7 @@ class RobotInpaintProcessor(BaseProcessor):
             principalpixel=np.array([img_w/2-cx, cy-img_h/2]),
             focalpixel=np.array([fx, fy])
         )
-    
+
     def _get_image_dimensions(self) -> Tuple[int, int]:
         """
         Calculate image dimensions based on input resolution configuration.
@@ -710,13 +744,17 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         # Epic
         if self.input_resolution == 256:
-            img_w = 456 
+            img_w = 456
         # Phantom paper
         elif self.input_resolution == 1080:
             img_w = self.input_resolution * 16 // 9
+        elif self.input_resolution == 128:
+            img_w = 228
+        else:
+            img_w = self.input_resolution * 16 // 9
         img_h = self.input_resolution
         return img_w, img_h
-    
+
     def _calculate_image_offset(self, img_w: int, img_h: int) -> int:
         """
         Calculate horizontal image offset for square aspect ratio processing.
@@ -733,7 +771,7 @@ class RobotInpaintProcessor(BaseProcessor):
         else:
             offset = 0
         return offset
-    
+
     def _get_camera_intrinsics(self, offset: int) -> Tuple[float, float, float, float]:
         """
         Extract camera intrinsic parameters with offset correction.
@@ -762,7 +800,7 @@ class RobotInpaintProcessor(BaseProcessor):
         sensor_width = img_w / fy / 1000
         sensor_height = img_h / fx / 1000
         return sensor_width, sensor_height
-    
+
     @staticmethod
     def _convert_real_camera_ori_to_mujoco(camera_ori_matrix: np.ndarray) -> np.ndarray:
         """
@@ -776,10 +814,8 @@ class RobotInpaintProcessor(BaseProcessor):
         """
         # Apply coordinate system transformation (flip Y and Z axes)
         camera_ori_matrix[:, [1, 2]] = -camera_ori_matrix[:, [1, 2]]
-        
+
         # Convert to quaternion in MuJoCo's WXYZ format
         r = Rotation.from_matrix(camera_ori_matrix)
         camera_ori_wxyz = r.as_quat(scalar_first=True)
         return camera_ori_wxyz
- 
-
