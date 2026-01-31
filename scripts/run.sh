@@ -109,7 +109,7 @@ python "${REPO_ROOT}/phantom/phantom/process_data.py" \
   processed_data_root_dir="${PROCESSED_OUT}" \
   mode=robot_inpaint \
   robot=Panda \
-  gripper=Robotiq85 \
+  gripper=Panda \
   bimanual_setup=single_arm \
   target_hand=right \
   camera_intrinsics="${INTRINSICS_OUT}" \
