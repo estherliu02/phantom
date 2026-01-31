@@ -1,5 +1,3 @@
-## README.md
-
 # Phantom data pipeline (Mac/Linux)
 
 ## 1) Install repo deps
@@ -11,13 +9,13 @@ cd phantom
 ./install_mac.sh   # macOS
 # ./install_linux.sh   # Linux
 cd ..
+conda activate phantom
 ```
 
 Then install runtime deps (skip if linux):
 
 ```bash
 pip install torch torchvision torchaudio
-conda install -c conda-forge egl-probe
 ```
 
 ### macOS note (egl_probe import issue)
@@ -53,7 +51,7 @@ uploads/stack_d1_abs/camera_meta.json
 From repo root:
 
 ```bash
-bash scripts/run.sh stack_d1_abs spaceview
+bash phantom/scripts/run.sh stack_d1_abs spaceview
 ```
 
 Arguments:

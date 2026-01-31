@@ -19,7 +19,7 @@ if [[ -z "${DATA_NAME}" ]]; then
   exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 UPLOAD_DIR="${REPO_ROOT}/uploads/${DATA_NAME}"
 HDF5_IN="${UPLOAD_DIR}/${DATA_NAME}.hdf5"
 CAM_META="${UPLOAD_DIR}/camera_meta.json"
@@ -27,8 +27,8 @@ CAM_META="${UPLOAD_DIR}/camera_meta.json"
 RAW_OUT="${REPO_ROOT}/raw_data/${DATA_NAME}"
 PROCESSED_OUT="${REPO_ROOT}/data/processed_data"
 
-INTRINSICS_OUT="${UPLOAD_DIR}/camera_intrinsics.json"
-EXTRINSICS_OUT="${UPLOAD_DIR}/camera_extrinsics.json"
+INTRINSICS_OUT="${UPLOAD_DIR}/camera_intrinsics_${VIEW}.json"
+EXTRINSICS_OUT="${UPLOAD_DIR}/camera_extrinsics_${VIEW}.json"
 HDF5_OUT="${UPLOAD_DIR}/${DATA_NAME}_overlay.hdf5"
 
 # ----- sanity checks -----
